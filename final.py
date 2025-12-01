@@ -17,7 +17,7 @@ NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = "10041004"   # 네 비밀번호
 
 # 네 인스타그램 쿠키 문자열 넣기
-INSTAGRAM_COOKIE = '여기에_네_인스타그램_쿠키_문자열'
+INSTAGRAM_COOKIE = 'csrftoken=U7FXjmOe_MgvHktwe5vZmn; datr=cbyqaMBs2ooJlzayVIfv-l8z; ig_did=3C93A83B-CA2A-4DBC-BB3F-E8DCD6A63D9C; ig_nrcb=1; mid=aKq8dgAEAAFWaaPYD7nVuqXRzWkm; ps_l=1; ps_n=1; ds_user_id=4223704197; ig_lang=ko; sessionid=4223704197%3Ac4Jnq1ijqpanQm%3A22%3AAYgDoQ3Wjq8Am90Rz-fjvM39XffOSp4nuSV4naUBIA; rur="VLL\0544223704197\0541796016861:01fed97d48627db54da4ff59c82727b98689bd37aaa563d21a7e0982dd5cba586f55c39c"'
 
 # 큐에서 한 번에 가져올 작업 개수 (너무 작으면 DB 왕복 많아지고, 너무 크면 메모리 잡아먹음)
 TASK_BATCH_SIZE = 10
@@ -74,7 +74,7 @@ def username_to_user_id(username: str, cookie: str) -> str | None:
     }
 
     r = requests.get(url, headers=headers)
-    print("[UserID 응답]", r.status_code)
+    print(f"[UserID 응답] {username} ->", r.status_code)
 
     if r.status_code != 200:
         print("❌ user_id 조회 실패:", r.text[:200])
@@ -263,15 +263,23 @@ def store_followings_and_enqueue(tx, src_id: str, depth: int, depth_limit: int, 
 # BFS 크롤링 (Persistent Queue 버전)
 ########################################################
 
-def bfs_crawl_persistent(start_username: str, cookie: str, depth_limit: int = 2):
+def bfs_crawl_persistent(start_usernames, cookie: str, depth_limit: int = 2):
     """
-    - 시작 username을 user_id로 변환
-    - Neo4j 안에 큐(:CrawlTask)를 만들어서 BFS
+    - 시작 username(들)을 user_id로 변환
+    - Neo4j 안에 큐(:CrawlTask)를 여러 개 만들어서 BFS 시작점 여러 개 등록
     - 프로세스가 죽어도 DB에 남은 큐를 기준으로 재시작 가능
+
+    start_usernames:
+      - 문자열 하나 ("katarinabluu")
+      - 또는 문자열 리스트(["a", "b", "c"])
     """
-    start_id = username_to_user_id(start_username, cookie)
-    if not start_id:
-        print("❌ user_id 조회 실패")
+    # 문자열 하나 들어와도 리스트로 변환
+    if isinstance(start_usernames, str):
+        start_usernames = [start_usernames]
+
+    # 혹시 빈 리스트가 들어오면 바로 종료
+    if not start_usernames:
+        print("❌ start_usernames 가 비어 있습니다.")
         return
 
     with driver.session() as session:
@@ -281,10 +289,26 @@ def bfs_crawl_persistent(start_username: str, cookie: str, depth_limit: int = 2)
         # 이전 실행에서 죽은 RUNNING 작업들 복구
         session.execute_write(reset_stale_running_tasks, STALE_RUNNING_MS)
 
-        # 시작 유저 + 시작 작업 enqueue (이미 있으면 무시됨)
-        session.execute_write(save_start_user_and_task, start_id, start_username, 0)
+        # 여러 시작 유저 처리
+        start_infos: list[tuple[str, str]] = []  # (username, user_id)
 
-        print(f"🚀 BFS 시작: {start_username} (user_id={start_id}), depth_limit={depth_limit}")
+        for username in start_usernames:
+            start_id = username_to_user_id(username, cookie)
+            if not start_id:
+                print(f"❌ {username} → user_id 조회 실패, 이 유저는 스킵.")
+                continue
+
+            # 시작 유저 + 시작 작업 enqueue (이미 있으면 MERGE라 중복 X)
+            session.execute_write(save_start_user_and_task, start_id, username, 0)
+            start_infos.append((username, start_id))
+
+        if not start_infos:
+            print("❌ 시작 가능한 유저가 하나도 없습니다. 종료.")
+            return
+
+        print(f"🚀 BFS 시작 (start points {len(start_infos)}개, depth_limit={depth_limit})")
+        for uname, uid in start_infos:
+            print(f"   - {uname} (user_id={uid})")
 
         processed_count = 0
 
@@ -326,8 +350,7 @@ def bfs_crawl_persistent(start_username: str, cookie: str, depth_limit: int = 2)
                     session.execute_write(
                         mark_task_error, user_id, depth, str(e)
                     )
-                    # 너무 공격적으로 재시도하면 차단 위험 → 여기서는 그냥 다음 작업으로 넘어감
-                    continue
+                    continue  # 다음 task 로
 
         print("\n🎉 BFS 크롤링 완료!")
         print("총 처리한 작업 수:", processed_count)
@@ -338,9 +361,16 @@ def bfs_crawl_persistent(start_username: str, cookie: str, depth_limit: int = 2)
 ########################################################
 
 if __name__ == "__main__":
-    # 실제로 사용할 때 username / cookie / depth_limit 설정해서 호출
+    # 1) 하나만 넣고 싶으면 문자열
+    # bfs_crawl_persistent(
+    #     start_usernames="katarinabluu",
+    #     cookie=INSTAGRAM_COOKIE,
+    #     depth_limit=1
+    # )
+
+    # 2) 여러 개를 동시에 시작점으로 주고 싶으면 리스트
     bfs_crawl_persistent(
-        start_username="katarinabluu",
+        start_usernames=["katarinabluu", "premierleague", "instagram"],
         cookie=INSTAGRAM_COOKIE,
         depth_limit=1
     )
